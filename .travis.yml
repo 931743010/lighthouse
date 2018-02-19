@@ -1,40 +1,50 @@
+sudo: required
 language: node_js
+branches:
+  only:
+  - master
 matrix:
   include:
-    - node_js: "4.3.2"
-    - node_js: "5"
-    - node_js: "6"
-    - node_js: "7"
-sudo: required
+    - node_js: "6.9.1"
+    - node_js: "8"
+      if: head_branch IS blank AND branch = master
+    - node_js: "9"
+      if: head_branch IS blank AND branch = master
 dist: trusty
 cache:
-   directories:
-     - node_modules
-     - chrome-linux
-     - lighthouse-extension/node_modules
-     - lighthouse-viewer/node_modules
+  yarn: true
+  directories:
+    - node_modules
+    - lighthouse-extension/node_modules
+    - lighthouse-viewer/node_modules
+    - /home/travis/.rvm/gems/
 install:
-  - npm install
+  - yarn
+  # travis can't handle the parallel install (without caches)
+  - yarn run install-all:task:windows
 before_script:
-  - npm i -g typescript@2.0
-  - npm --prefix ./lighthouse-extension install ./lighthouse-extension
-  - npm --prefix ./lighthouse-viewer install ./lighthouse-viewer
   - export DISPLAY=:99.0
-  - export LIGHTHOUSE_CHROMIUM_PATH="$(pwd)/chrome-linux/chrome"
+  - export CHROME_PATH="$(pwd)/chrome-linux/chrome"
   - sh -e /etc/init.d/xvfb start
-  - ./lighthouse-core/scripts/download-chrome.sh
-  - cd lighthouse-cli && tsc && cd ..
+  - yarn build-all
 script:
-  - if [[ $(node -v) =~ ^v4.* ]]; then export __node_harmony=--harmony; fi
-  - npm run lint
-  - npm run unit
-  - npm run smoke
-  - npm run smokehouse
-  - cd lighthouse-extension
-  - gulp build -- $__node_harmony
-  - cd ..
-  - cd lighthouse-viewer
-  - gulp
-  - cd ..
+  - echo $TRAVIS_EVENT_TYPE;
+  - echo $TRAVIS_BRANCH
+  - yarn bundlesize
+  - yarn lint
+  - yarn unit
+  - yarn type-check
+  - yarn closure
+  - yarn smoke
+  - yarn smokehouse
+  # _JAVA_OPTIONS is breaking parsing of compiler output. See #3338.
+  - unset _JAVA_OPTIONS
+  - yarn compile-devtools
+before_cache:
+  # the `yarn compile-devtools` task adds these to node_modules, which slows down caching
+  - rm -rf ./node_modules/temp-devtoolsfrontend/
+  - rm -rf ./node_modules/temp-devtoolsprotocol/
 after_success:
-  - npm run coveralls
+  - yarn coveralls
+addons:
+  chrome: stable

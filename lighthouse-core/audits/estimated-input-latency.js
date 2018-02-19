@@ -1,24 +1,14 @@
 /**
- * @license
- * Copyright 2016 Google Inc. All rights reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * @license Copyright 2016 Google Inc. All Rights Reserved.
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License. You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
+ * Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.
  */
 'use strict';
 
 const Audit = require('./audit');
+const Util = require('../report/v2/renderer/util');
 const TracingProcessor = require('../lib/traces/tracing-processor');
-const Formatter = require('../formatters/formatter');
+const LHError = require('../lib/errors');
 
 // Parameters (in ms) for log-normal CDF scoring. To see the curve:
 // https://www.desmos.com/calculator/srv0hqhf7d
@@ -31,23 +21,25 @@ class EstimatedInputLatency extends Audit {
    */
   static get meta() {
     return {
-      category: 'Performance',
       name: 'estimated-input-latency',
       description: 'Estimated Input Latency',
-      optimalValue: SCORING_POINT_OF_DIMINISHING_RETURNS.toLocaleString() + 'ms',
-      helpText: 'The score above is an estimate of how long your app takes to respond to user input, in milliseconds. There is a 90% probability that a user encounters this amount of latency, or less. 10% of the time a user can expect additional latency. If your score is higher than Lighthouse\'s target score, users may perceive your app as laggy. <a href="https://developers.google.com/web/tools/lighthouse/audits/estimated-input-latency" rel="noopener" target="_blank">Learn more</a>.',
-      requiredArtifacts: ['traces']
+      helpText: 'The score above is an estimate of how long your app takes to respond to user ' +
+          'input, in milliseconds. There is a 90% probability that a user encounters this amount ' +
+          'of latency, or less. 10% of the time a user can expect additional latency. If your ' +
+          'latency is higher than 50 ms, users may perceive your app as laggy. ' +
+          '[Learn more](https://developers.google.com/web/tools/lighthouse/audits/estimated-input-latency).',
+      scoringMode: Audit.SCORING_MODES.NUMERIC,
+      requiredArtifacts: ['traces'],
     };
   }
 
-  static calculate(speedline, trace) {
-    // Use speedline's first paint as start of range for input latency check.
-    const startTime = speedline.first;
+  static calculate(tabTrace) {
+    const startTime = tabTrace.timings.firstMeaningfulPaint;
+    if (!startTime) {
+      throw new LHError(LHError.errors.NO_FMP);
+    }
 
-    const tracingProcessor = new TracingProcessor();
-    const model = tracingProcessor.init(trace);
-    const latencyPercentiles = TracingProcessor.getRiskToResponsiveness(model, trace, startTime);
-
+    const latencyPercentiles = TracingProcessor.getRiskToResponsiveness(tabTrace, startTime);
     const ninetieth = latencyPercentiles.find(result => result.percentile === 0.9);
     const rawValue = parseFloat(ninetieth.time.toFixed(1));
 
@@ -57,20 +49,20 @@ class EstimatedInputLatency extends Audit {
     //  Median = 100ms
     //  75th Percentile ≈ 133ms
     //  95th Percentile ≈ 199ms
-    const distribution = TracingProcessor.getLogNormalDistribution(SCORING_MEDIAN,
-        SCORING_POINT_OF_DIMINISHING_RETURNS);
-    const score = 100 * distribution.computeComplementaryPercentile(ninetieth.time);
+    const score = Audit.computeLogNormalScore(
+      ninetieth.time,
+      SCORING_POINT_OF_DIMINISHING_RETURNS,
+      SCORING_MEDIAN
+    );
 
-    return EstimatedInputLatency.generateAuditResult({
-      score: Math.round(score),
-      optimalValue: this.meta.optimalValue,
+    return {
+      score,
       rawValue,
-      displayValue: `${rawValue}ms`,
+      displayValue: Util.formatMilliseconds(rawValue, 1),
       extendedInfo: {
         value: latencyPercentiles,
-        formatter: Formatter.SUPPORTED_FORMATS.NULL
-      }
-    });
+      },
+    };
   }
 
   /**
@@ -82,14 +74,8 @@ class EstimatedInputLatency extends Audit {
   static audit(artifacts) {
     const trace = artifacts.traces[this.DEFAULT_PASS];
 
-    return artifacts.requestSpeedline(trace)
-      .then(speedline => EstimatedInputLatency.calculate(speedline, trace))
-      .catch(err => {
-        return EstimatedInputLatency.generateAuditResult({
-          rawValue: -1,
-          debugString: 'Speedline unable to parse trace contents: ' + err.message
-        });
-      });
+    return artifacts.requestTraceOfTab(trace)
+        .then(EstimatedInputLatency.calculate);
   }
 }
 

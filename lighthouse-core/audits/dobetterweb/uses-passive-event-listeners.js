@@ -1,18 +1,7 @@
 /**
- * @license
- * Copyright 2016 Google Inc. All rights reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * @license Copyright 2016 Google Inc. All Rights Reserved.
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License. You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
+ * Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.
  */
 
 /**
@@ -22,31 +11,21 @@
 
 'use strict';
 
-const URL = require('../../lib/url-shim');
-const Audit = require('../audit');
-const EventHelpers = require('../../lib/event-helpers');
-const Formatter = require('../../formatters/formatter');
+const ViolationAudit = require('../violation-audit');
 
-class PassiveEventsAudit extends Audit {
-
-  static get SCROLL_BLOCKING_EVENTS() {
-    // See https://github.com/WICG/EventListenerOptions/blob/gh-pages/explainer.md
-    return ['wheel', 'mousewheel', 'touchstart', 'touchmove'];
-  }
-
+class PassiveEventsAudit extends ViolationAudit {
   /**
    * @return {!AuditMeta}
    */
   static get meta() {
     return {
-      category: 'JavaScript',
       name: 'uses-passive-event-listeners',
-      description: 'Site uses passive listeners to improve scrolling performance',
-      helpText: 'Consider marking your touch and wheel event listeners as <code>passive</code> ' +
-          'to improve your page\'s scroll performance. <a href="https://developers.google.com/' +
-          'web/tools/lighthouse/audits/passive-event-listeners" target="_blank" ' +
-          'rel="noopener">Learn more</a>.',
-      requiredArtifacts: ['URL', 'EventListeners']
+      description: 'Uses passive listeners to improve scrolling performance',
+      failureDescription: 'Does not use passive listeners to improve scrolling performance',
+      helpText: 'Consider marking your touch and wheel event listeners as `passive` ' +
+          'to improve your page\'s scroll performance. ' +
+          '[Learn more](https://developers.google.com/web/tools/lighthouse/audits/passive-event-listeners).',
+      requiredArtifacts: ['ChromeConsoleMessages'],
     };
   }
 
@@ -55,33 +34,21 @@ class PassiveEventsAudit extends Audit {
    * @return {!AuditResult}
    */
   static audit(artifacts) {
-    if (artifacts.EventListeners.rawValue === -1) {
-      return PassiveEventsAudit.generateAuditResult(artifacts.EventListeners);
-    }
+    const results = ViolationAudit.getViolationResults(artifacts, /passive event listener/);
 
-    const listeners = artifacts.EventListeners;
-    const pageHost = new URL(artifacts.URL.finalUrl).host;
+    const headings = [
+      {key: 'url', itemType: 'url', text: 'URL'},
+      {key: 'label', itemType: 'text', text: 'Location'},
+    ];
+    const details = ViolationAudit.makeTableDetails(headings, results);
 
-    // Flags all touch and wheel listeners that 1) are from same host
-    // 2) are not passive 3) do not call preventDefault()
-    const results = listeners.filter(loc => {
-      const isScrollBlocking = this.SCROLL_BLOCKING_EVENTS.indexOf(loc.type) !== -1;
-      const mentionsPreventDefault = loc.handler.description.match(
-            /\.preventDefault\(\s*\)/g);
-      const sameHost = loc.url ? new URL(loc.url).host === pageHost : true;
-      return sameHost && isScrollBlocking && !loc.passive &&
-             !mentionsPreventDefault;
-    }).map(EventHelpers.addFormattedCodeSnippet);
-
-    const groupedResults = EventHelpers.groupCodeSnippetsByLocation(results);
-
-    return PassiveEventsAudit.generateAuditResult({
-      rawValue: groupedResults.length === 0,
+    return {
+      rawValue: results.length === 0,
       extendedInfo: {
-        formatter: Formatter.SUPPORTED_FORMATS.URLLIST,
-        value: groupedResults
-      }
-    });
+        value: results,
+      },
+      details,
+    };
   }
 }
 

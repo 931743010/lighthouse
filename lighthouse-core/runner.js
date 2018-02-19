@@ -1,42 +1,37 @@
 /**
- * @license
- * Copyright 2016 Google Inc. All rights reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * @license Copyright 2016 Google Inc. All Rights Reserved.
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License. You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
+ * Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.
  */
+// @ts-nocheck
 'use strict';
 
 const Driver = require('./gather/driver.js');
 const GatherRunner = require('./gather/gather-runner');
-const Aggregate = require('./aggregator/aggregate');
+const ReportScoring = require('./scoring');
 const Audit = require('./audits/audit');
+const emulation = require('./lib/emulation');
+const log = require('lighthouse-logger');
 const assetSaver = require('./lib/asset-saver');
-const log = require('./lib/log');
 const fs = require('fs');
 const path = require('path');
 const URL = require('./lib/url-shim');
+const Sentry = require('./lib/sentry');
+
+const basePath = path.join(process.cwd(), 'latest-run');
 
 class Runner {
   static run(connection, opts) {
     // Clean opts input.
     opts.flags = opts.flags || {};
 
-    const config = opts.config;
+    // List of top-level warnings for this Lighthouse run.
+    const lighthouseRunWarnings = [];
 
     // save the initialUrl provided by the user
     opts.initialUrl = opts.url;
     if (typeof opts.initialUrl !== 'string' || opts.initialUrl.length === 0) {
-      return Promise.reject(new Error('You must provide a url to the driver'));
+      return Promise.reject(new Error('You must provide a url to the runner'));
     }
 
     let parsedURL;
@@ -47,6 +42,13 @@ class Runner {
       return Promise.reject(err);
     }
 
+    const sentryContext = Sentry.getContext();
+    Sentry.captureBreadcrumb({
+      message: 'Run started',
+      category: 'lifecycle',
+      data: sentryContext && sentryContext.extra,
+    });
+
     // If the URL isn't https and is also not localhost complain to the user.
     if (parsedURL.protocol !== 'https:' && parsedURL.hostname !== 'localhost') {
       log.warn('Lighthouse', 'The URL provided should be on HTTPS');
@@ -56,96 +58,141 @@ class Runner {
     // canonicalize URL with any trailing slashes neccessary
     opts.url = parsedURL.href;
 
-    // Check that there are passes & audits...
-    const validPassesAndAudits = config.passes && config.audits;
-
-    // ... or that there are artifacts & audits.
-    const validArtifactsAndAudits = config.artifacts && config.audits;
-
     // Make a run, which can be .then()'d with whatever needs to run (based on the config).
     let run = Promise.resolve();
 
-    // If there are passes run the GatherRunner and gather the artifacts. If not, we will need
-    // to check that there are artifacts specified in the config, and throw if not.
-    if (validPassesAndAudits || validArtifactsAndAudits) {
-      if (validPassesAndAudits) {
-        opts.driver = opts.driverMock || new Driver(connection);
-        // Finally set up the driver to gather.
-        run = run.then(_ => GatherRunner.run(config.passes, opts));
-      } else if (validArtifactsAndAudits) {
-        run = run.then(_ => {
-          return Object.assign(GatherRunner.instantiateComputedArtifacts(), config.artifacts);
-        });
-      }
+    // User can run -G solo, -A solo, or -GA together
+    // -G and -A will do run partial lighthouse pipelines,
+    // and -GA will run everything plus save artifacts to disk
 
-      // Basic check that the traces (gathered or loaded) are valid.
-      run = run.then(artifacts => {
-        for (const passName of Object.keys(artifacts.traces || {})) {
-          const trace = artifacts.traces[passName];
-          if (!Array.isArray(trace.traceEvents)) {
-            throw new Error(passName + ' trace was invalid. `traceEvents` was not an array.');
-          }
-        }
-
-        return artifacts;
-      });
-
-      // Ignoring these two flags for coverage as this functionality is not exposed by the module.
-      /* istanbul ignore next */
-      if (opts.flags.saveArtifacts) {
-        run = run.then(artifacts => {
-          opts.flags.saveArtifacts && assetSaver.saveArtifacts(artifacts);
-          return artifacts;
-        });
-      }
-      if (opts.flags.saveAssets) {
-        run = run.then(artifacts => {
-          return assetSaver.saveAssets(opts, artifacts)
-            .then(_ => artifacts);
-        });
-      }
-
-      // Run each audit sequentially, the auditResults array has all our fine work
-      const auditResults = [];
-      run = run.then(artifacts => config.audits.reduce((chain, audit) => {
-        return chain.then(_ => {
-          return Runner._runAudit(audit, artifacts);
-        }).then(ret => auditResults.push(ret));
-      }, Promise.resolve()).then(_ => auditResults));
-    } else if (config.auditResults) {
-      // If there are existing audit results, surface those here.
-      run = run.then(_ => config.auditResults);
+    // Gather phase
+    // Either load saved artifacts off disk, from config, or get from the browser
+    if (opts.flags.auditMode && !opts.flags.gatherMode) {
+      run = run.then(_ => Runner._loadArtifactsFromDisk());
+    } else if (opts.config.artifacts) {
+      run = run.then(_ => opts.config.artifacts);
     } else {
-      const err = Error(
-          'The config must provide passes and audits, artifacts and audits, or auditResults');
-      return Promise.reject(err);
+      run = run.then(_ => Runner._gatherArtifactsFromBrowser(opts, connection));
     }
 
-    // Format and aggregate results before returning.
-    run = run
-      .then(auditResults => {
-        const formattedAudits = auditResults.reduce((formatted, audit) => {
-          formatted[audit.name] = audit;
-          return formatted;
-        }, {});
+    // Potentially quit early
+    if (opts.flags.gatherMode && !opts.flags.auditMode) return run;
 
-        // Only run aggregations if needed.
-        let aggregations = [];
-        if (config.aggregations) {
-          aggregations = config.aggregations.map(a => Aggregate.aggregate(a, auditResults));
-        }
+    // Audit phase
+    run = run.then(artifacts => Runner._runAudits(opts, artifacts));
 
-        return {
-          lighthouseVersion: require('../package').version,
-          generatedTime: (new Date()).toJSON(),
-          initialUrl: opts.initialUrl,
-          url: opts.url,
-          audits: formattedAudits,
-          aggregations
-        };
+    // LHR construction phase
+    run = run.then(runResults => {
+      log.log('status', 'Generating results...');
+
+      if (runResults.artifacts.LighthouseRunWarnings) {
+        lighthouseRunWarnings.push(...runResults.artifacts.LighthouseRunWarnings);
+      }
+
+      // Entering: Conclusion of the lighthouse result object
+      const resultsById = {};
+      for (const audit of runResults.auditResults) resultsById[audit.name] = audit;
+
+      let report;
+      if (opts.config.categories) {
+        report = Runner._scoreAndCategorize(opts, resultsById);
+      }
+
+      return {
+        userAgent: runResults.artifacts.UserAgent,
+        lighthouseVersion: require('../package').version,
+        generatedTime: (new Date()).toJSON(),
+        initialUrl: opts.initialUrl,
+        url: opts.url,
+        runWarnings: lighthouseRunWarnings,
+        audits: resultsById,
+        artifacts: runResults.artifacts,
+        runtimeConfig: Runner.getRuntimeConfig(opts.flags),
+        score: report ? report.score : 0,
+        reportCategories: report ? report.categories : [],
+        reportGroups: opts.config.groups,
+      };
+    }).catch(err => {
+      return Sentry.captureException(err, {level: 'fatal'}).then(() => {
+        throw err;
       });
+    });
 
     return run;
+  }
+
+  /**
+   * No browser required, just load the artifacts from disk
+   * @return {!Promise<!Artifacts>}
+   */
+  static _loadArtifactsFromDisk() {
+    return assetSaver.loadArtifacts(basePath);
+  }
+
+  /**
+   * Establish connection, load page and collect all required artifacts
+   * @param {*} opts
+   * @param {*} connection
+   * @return {!Promise<!Artifacts>}
+   */
+  static _gatherArtifactsFromBrowser(opts, connection) {
+    if (!opts.config.passes) {
+      return Promise.reject(new Error('No browser artifacts are either provided or requested.'));
+    }
+
+    opts.driver = opts.driverMock || new Driver(connection);
+    return GatherRunner.run(opts.config.passes, opts).then(artifacts => {
+      const flags = opts.flags;
+      const shouldSave = flags.gatherMode;
+      const p = shouldSave ? Runner._saveArtifacts(artifacts): Promise.resolve();
+      return p.then(_ => artifacts);
+    });
+  }
+
+  /**
+   * Save collected artifacts to disk
+   * @param {!Artifacts} artifacts
+   * @return {!Promise>}
+   */
+  static _saveArtifacts(artifacts) {
+    return assetSaver.saveArtifacts(artifacts, basePath);
+  }
+
+  /**
+   * Save collected artifacts to disk
+   * @param {*} opts
+   * @param {!Artifacts} artifacts
+   * @return {!Promise<{auditResults: AuditResults, artifacts: Artifacts}>>}
+   */
+  static _runAudits(opts, artifacts) {
+    if (!opts.config.audits) {
+      return Promise.reject(new Error('No audits to evaluate.'));
+    }
+
+    log.log('status', 'Analyzing and running audits...');
+    artifacts = Object.assign(Runner.instantiateComputedArtifacts(),
+        artifacts || opts.config.artifacts);
+
+    // Run each audit sequentially
+    const auditResults = [];
+    let promise = Promise.resolve();
+    for (const auditDefn of opts.config.audits) {
+      promise = promise.then(_ => {
+        return Runner._runAudit(auditDefn, artifacts).then(ret => auditResults.push(ret));
+      });
+    }
+    return promise.then(_ => {
+      const runResults = {artifacts, auditResults};
+      return runResults;
+    });
+  }
+
+  /**
+   * @param {{}} opts
+   * @param {{}} resultsById
+   */
+  static _scoreAndCategorize(opts, resultsById) {
+    return ReportScoring.scoreAllCategories(opts.config, resultsById);
   }
 
   /**
@@ -156,13 +203,14 @@ class Runner {
    * @return {!Promise<!AuditResult>}
    * @private
    */
-  static _runAudit(audit, artifacts) {
+  static _runAudit(auditDefn, artifacts) {
+    const audit = auditDefn.implementation;
     const status = `Evaluating: ${audit.meta.description}`;
 
     return Promise.resolve().then(_ => {
       log.log('status', status);
 
-      // Return an early error if an artifact required for the audit is missing.
+      // Return an early error if an artifact required for the audit is missing or an error.
       for (const artifactName of audit.meta.requiredArtifacts) {
         const noArtifact = typeof artifacts[artifactName] === 'undefined';
 
@@ -173,14 +221,44 @@ class Runner {
         if (noArtifact || noTrace) {
           log.warn('Runner',
               `${artifactName} gatherer, required by audit ${audit.meta.name}, did not run.`);
-          return audit.generateAuditResult({
-            rawValue: -1,
-            debugString: `Required ${artifactName} gatherer did not run.`
+          throw new Error(`Required ${artifactName} gatherer did not run.`);
+        }
+
+        // If artifact was an error, it must be non-fatal (or gatherRunner would
+        // have thrown). Output error result on behalf of audit.
+        if (artifacts[artifactName] instanceof Error) {
+          const artifactError = artifacts[artifactName];
+          Sentry.captureException(artifactError, {
+            tags: {gatherer: artifactName},
+            level: 'error',
           });
+
+          log.warn('Runner', `${artifactName} gatherer, required by audit ${audit.meta.name},` +
+            ` encountered an error: ${artifactError.message}`);
+
+          // Create a friendlier display error and mark it as expected to avoid duplicates in Sentry
+          const error = new Error(
+              `Required ${artifactName} gatherer encountered an error: ${artifactError.message}`);
+          error.expected = true;
+          throw error;
         }
       }
+      // all required artifacts are in good shape, so we proceed
+      return audit.audit(artifacts, {options: auditDefn.options || {}});
+    // Fill remaining audit result fields.
+    }).then(auditResult => Audit.generateAuditResult(audit, auditResult))
+    .catch(err => {
+      log.warn(audit.meta.name, `Caught exception: ${err.message}`);
+      if (err.fatal) {
+        throw err;
+      }
 
-      return audit.audit(artifacts);
+      Sentry.captureException(err, {tags: {audit: audit.meta.name}, level: 'error'});
+      // Non-fatal error become error audit result.
+      const debugString = err.friendlyMessage ?
+        `${err.friendlyMessage} (${err.message})` :
+        `Audit error: ${err.message}`;
+      return Audit.generateErrorAuditResult(audit, debugString);
     }).then(result => {
       log.verbose('statusEnd', status);
       return result;
@@ -192,14 +270,30 @@ class Runner {
    * @return {!Array<string>}
    */
   static getAuditList() {
+    const ignoredFiles = [
+      'audit.js',
+      'violation-audit.js',
+      'accessibility/axe-audit.js',
+      'multi-check-audit.js',
+      'byte-efficiency/byte-efficiency-audit.js',
+      'manual/manual-audit.js',
+    ];
+
     const fileList = [
       ...fs.readdirSync(path.join(__dirname, './audits')),
       ...fs.readdirSync(path.join(__dirname, './audits/dobetterweb')).map(f => `dobetterweb/${f}`),
+      ...fs.readdirSync(path.join(__dirname, './audits/seo')).map(f => `seo/${f}`),
+      ...fs.readdirSync(path.join(__dirname, './audits/seo/manual')).map(f => `seo/manual/${f}`),
       ...fs.readdirSync(path.join(__dirname, './audits/accessibility'))
-          .map(f => `accessibility/${f}`)
+          .map(f => `accessibility/${f}`),
+      ...fs.readdirSync(path.join(__dirname, './audits/accessibility/manual'))
+          .map(f => `accessibility/manual/${f}`),
+      ...fs.readdirSync(path.join(__dirname, './audits/byte-efficiency'))
+          .map(f => `byte-efficiency/${f}`),
+      ...fs.readdirSync(path.join(__dirname, './audits/manual')).map(f => `manual/${f}`),
     ];
     return fileList.filter(f => {
-      return /\.js$/.test(f) && f !== 'audit.js' && f !== 'accessibility/axe-audit.js';
+      return /\.js$/.test(f) && !ignoredFiles.includes(f);
     }).sort();
   }
 
@@ -210,10 +304,33 @@ class Runner {
   static getGathererList() {
     const fileList = [
       ...fs.readdirSync(path.join(__dirname, './gather/gatherers')),
+      ...fs.readdirSync(path.join(__dirname, './gather/gatherers/seo')).map(f => `seo/${f}`),
       ...fs.readdirSync(path.join(__dirname, './gather/gatherers/dobetterweb'))
-          .map(f => `dobetterweb/${f}`)
+          .map(f => `dobetterweb/${f}`),
     ];
     return fileList.filter(f => /\.js$/.test(f) && f !== 'gatherer.js').sort();
+  }
+
+  /**
+   * @return {!ComputedArtifacts}
+   */
+  static instantiateComputedArtifacts() {
+    const computedArtifacts = {};
+    const filenamesToSkip = [
+      'computed-artifact.js', // the base class which other artifacts inherit
+    ];
+
+    require('fs').readdirSync(__dirname + '/gather/computed').forEach(function(filename) {
+      if (filenamesToSkip.includes(filename)) return;
+
+      // Drop `.js` suffix to keep browserify import happy.
+      filename = filename.replace(/\.js$/, '');
+      const ArtifactClass = require('./gather/computed/' + filename);
+      const artifact = new ArtifactClass(computedArtifacts);
+      // define the request* function that will be exposed on `artifacts`
+      computedArtifacts['request' + artifact.name] = artifact.request.bind(artifact);
+    });
+    return computedArtifacts;
   }
 
   /**
@@ -260,6 +377,38 @@ class Runner {
     } catch (requireError) {}
 
     throw new Error(errorString + ` and '${relativePath}')`);
+  }
+
+  /**
+   * Get runtime configuration specified by the flags
+   * @param {!Object} flags
+   * @return {!Object} runtime config
+   */
+  static getRuntimeConfig(flags) {
+    const emulationDesc = emulation.getEmulationDesc();
+    const environment = [
+      {
+        name: 'Device Emulation',
+        enabled: !flags.disableDeviceEmulation,
+        description: emulationDesc['deviceEmulation'],
+      },
+      {
+        name: 'Network Throttling',
+        enabled: !flags.disableNetworkThrottling,
+        description: emulationDesc['networkThrottling'],
+      },
+      {
+        name: 'CPU Throttling',
+        enabled: !flags.disableCpuThrottling,
+        description: emulationDesc['cpuThrottling'],
+      },
+    ];
+
+    return {
+      environment,
+      blockedUrlPatterns: flags.blockedUrlPatterns || [],
+      extraHeaders: flags.extraHeaders || {},
+    };
   }
 }
 

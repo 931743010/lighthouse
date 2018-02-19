@@ -1,29 +1,15 @@
 /**
- * @license
- * Copyright 2016 Google Inc. All rights reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * @license Copyright 2016 Google Inc. All Rights Reserved.
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License. You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
+ * Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.
  */
-
 'use strict';
 
 const ComputedArtifact = require('./computed-artifact');
 const WebInspector = require('../../lib/web-inspector');
-
-const includes = (arr, elm) => arr.indexOf(elm) > -1;
+const assert = require('assert');
 
 class CriticalRequestChains extends ComputedArtifact {
-
   get name() {
     return 'CriticalRequestChains';
   }
@@ -32,25 +18,35 @@ class CriticalRequestChains extends ComputedArtifact {
    * For now, we use network priorities as a proxy for "render-blocking"/critical-ness.
    * It's imperfect, but there is not a higher-fidelity signal available yet.
    * @see https://docs.google.com/document/d/1bCDuq9H1ih9iNjgzyAL0gpwNFiEP4TZS-YLRp_RuMlc
-   * @param  {any} request
+   * @param {any} request
+   * @param {!WebInspector.NetworkRequest} mainResource
    */
-  isCritical(request) {
-    // XHRs are fetched at High priority, but we exclude them, as they are unlikely to be critical
+  static isCritical(request, mainResource) {
+    assert.ok(mainResource, 'mainResource not provided');
     const resourceTypeCategory = request._resourceType && request._resourceType._category;
-    if (resourceTypeCategory === WebInspector.resourceTypes.XHR._category) {
+
+    // Iframes are considered High Priority but they are not render blocking
+    const isIframe = request._resourceType === WebInspector.resourceTypes.Document
+      && request.frameId !== mainResource.frameId;
+    // XHRs are fetched at High priority, but we exclude them, as they are unlikely to be critical
+    // Images are also non-critical.
+    // Treat any images missed by category, primarily favicons, as non-critical resources
+    const nonCriticalResourceTypes = [
+      WebInspector.resourceTypes.Image._category,
+      WebInspector.resourceTypes.XHR._category,
+    ];
+    if (nonCriticalResourceTypes.includes(resourceTypeCategory) ||
+        isIframe ||
+        request.mimeType && request.mimeType.startsWith('image/')) {
       return false;
     }
 
-    // Treat favicons as non-critical resources
-    if (request.mimeType === 'image/x-icon' ||
-        (request.parsedURL && request.parsedURL.lastPathComponent === 'favicon.ico')) {
-      return false;
-    }
-
-    return includes(['VeryHigh', 'High', 'Medium'], request.priority());
+    return ['VeryHigh', 'High', 'Medium'].includes(request.priority());
   }
 
-  compute_(networkRecords) {
+  static extractChain([networkRecords, mainResource]) {
+    networkRecords = networkRecords.filter(req => req.finished);
+
     // Build a map of requestID -> Node.
     const requestIdToRequests = new Map();
     for (const request of networkRecords) {
@@ -59,17 +55,8 @@ class CriticalRequestChains extends ComputedArtifact {
 
     // Get all the critical requests.
     /** @type {!Array<NetworkRequest>} */
-    const criticalRequests = networkRecords.filter(req => this.isCritical(req));
-
-    const flattenRequest = request => {
-      return {
-        url: request._url,
-        startTime: request.startTime,
-        endTime: request.endTime,
-        responseReceivedTime: request.responseReceivedTime,
-        transferSize: request.transferSize
-      };
-    };
+    const criticalRequests = networkRecords.filter(request =>
+      CriticalRequestChains.isCritical(request, mainResource));
 
     // Create a tree of critical requests.
     const criticalRequestChains = {};
@@ -81,13 +68,13 @@ class CriticalRequestChains extends ComputedArtifact {
       let ancestorRequest = request.initiatorRequest();
       let node = criticalRequestChains;
       while (ancestorRequest) {
-        const ancestorIsCritical = this.isCritical(ancestorRequest);
+        const ancestorIsCritical = CriticalRequestChains.isCritical(ancestorRequest, mainResource);
 
         // If the parent request isn't a high priority request it won't be in the
         // requestIdToRequests map, and so we can break the chain here. We should also
         // break it if we've seen this request before because this is some kind of circular
         // reference, and that's bad.
-        if (!ancestorIsCritical || includes(ancestors, ancestorRequest.requestId)) {
+        if (!ancestorIsCritical || ancestors.includes(ancestorRequest.requestId)) {
           // Set the ancestors to an empty array and unset node so that we don't add
           // the request in to the tree.
           ancestors.length = 0;
@@ -106,8 +93,8 @@ class CriticalRequestChains extends ComputedArtifact {
         const parentRequestId = parentRequest.requestId;
         if (!node[parentRequestId]) {
           node[parentRequestId] = {
-            request: flattenRequest(parentRequest),
-            children: {}
+            request: parentRequest,
+            children: {},
           };
         }
 
@@ -127,12 +114,25 @@ class CriticalRequestChains extends ComputedArtifact {
 
       // node should now point to the immediate parent for this request.
       node[request.requestId] = {
-        request: flattenRequest(request),
-        children: {}
+        request,
+        children: {},
       };
     }
 
     return criticalRequestChains;
+  }
+
+  /**
+   * @param {!DevtoolsLog} devtoolsLog
+   * @param {!ComputedArtifacts} artifacts
+   * @return {!Promise<!Object>}
+   */
+  compute_(devtoolsLog, artifacts) {
+    return Promise.all([
+      artifacts.requestNetworkRecords(devtoolsLog),
+      artifacts.requestMainResource(devtoolsLog),
+    ])
+      .then(CriticalRequestChains.extractChain);
   }
 }
 

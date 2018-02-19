@@ -1,28 +1,16 @@
 /**
- * @license
- * Copyright 2016 Google Inc. All Rights Reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * @license Copyright 2016 Google Inc. All Rights Reserved.
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License. You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
+ * Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.
  */
 'use strict';
 
 const Connection = require('./connection.js');
-const log = require('../../lib/log.js');
+const log = require('lighthouse-logger');
 
 /* globals chrome */
 
 class ExtensionConnection extends Connection {
-
   constructor() {
     super();
     this._tabId = null;
@@ -116,18 +104,14 @@ class ExtensionConnection extends Connection {
           // The error from the extension has a `message` property that is the
           // stringified version of the actual protocol error object.
           const message = chrome.runtime.lastError.message;
-          let error;
+          let errorMessage;
           try {
-            error = JSON.parse(message);
+            errorMessage = JSON.parse(message).message;
           } catch (e) {}
-          error = error || {message: 'Unknown debugger protocol error.'};
+          errorMessage = errorMessage || message || 'Unknown debugger protocol error.';
 
-          // handleRawError returns or throws synchronously, so try/catch awkwardly.
-          try {
-            return resolve(this.handleRawError(error, command));
-          } catch (err) {
-            return reject(err);
-          }
+          log.formatProtocol('method <= browser ERR', {method: command}, 'error');
+          return reject(new Error(`Protocol error (${command}): ${errorMessage}`));
         }
 
         log.formatProtocol('method <= browser OK', {method: command, params: result}, 'verbose');
@@ -140,8 +124,7 @@ class ExtensionConnection extends Connection {
     return new Promise((resolve, reject) => {
       const queryOpts = {
         active: true,
-        lastFocusedWindow: true,
-        windowType: 'normal'
+        currentWindow: true,
       };
 
       chrome.tabs.query(queryOpts, (tabs => {
@@ -149,8 +132,11 @@ class ExtensionConnection extends Connection {
           return reject(chrome.runtime.lastError);
         }
         if (tabs.length === 0) {
-          const message = 'Couldn\'t resolve current tab. Please file a bug.';
+          const message = 'Couldn\'t resolve current tab. Check your URL, reload, and try again.';
           return reject(new Error(message));
+        }
+        if (tabs.length > 1) {
+          log.warn('ExtensionConnection', '_queryCurrentTab returned multiple tabs');
         }
         resolve(tabs[0]);
       }));
@@ -158,10 +144,15 @@ class ExtensionConnection extends Connection {
   }
 
   /**
-   * Used by lighthouse-background to kick off the run on the current page
+   * Used by lighthouse-ext-background to kick off the run on the current page
    */
   getCurrentTabURL() {
-    return this._queryCurrentTab().then(tab => tab.url);
+    return this._queryCurrentTab().then(tab => {
+      if (!tab.url) {
+        log.error('ExtensionConnection', 'getCurrentTabURL returned empty string', tab);
+      }
+      return tab.url;
+    });
   }
 }
 

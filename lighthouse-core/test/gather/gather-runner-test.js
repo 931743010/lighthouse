@@ -1,19 +1,8 @@
 /**
- * Copyright 2016 Google Inc. All rights reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * @license Copyright 2016 Google Inc. All Rights Reserved.
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License. You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
+ * Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.
  */
-
 'use strict';
 
 /* eslint-env mocha */
@@ -22,7 +11,7 @@ const Gatherer = require('../../gather/gatherers/gatherer');
 const GatherRunner = require('../../gather/gather-runner');
 const assert = require('assert');
 const Config = require('../../config/config');
-const path = require('path');
+const unresolvedPerfLog = require('./../fixtures/unresolved-perflog.json');
 
 class TestGatherer extends Gatherer {
   constructor() {
@@ -44,7 +33,8 @@ class TestGathererNoArtifact extends Gatherer {
 
 const fakeDriver = require('./fake-driver');
 
-function getMockedEmulationDriver(emulationFn, netThrottleFn, cpuThrottleFn) {
+function getMockedEmulationDriver(emulationFn, netThrottleFn, cpuThrottleFn,
+  blockUrlFn, extraHeadersFn) {
   const Driver = require('../../gather/driver');
   const Connection = require('../../gather/connections/connection');
   const EmulationDriver = class extends Driver {
@@ -57,11 +47,17 @@ function getMockedEmulationDriver(emulationFn, netThrottleFn, cpuThrottleFn) {
     cacheNatives() {
       return Promise.resolve();
     }
-    cleanAndDisableBrowserCaches() {}
+    registerPerformanceObserver() {
+      return Promise.resolve();
+    }
+    cleanBrowserCaches() {}
     clearDataForOrigin() {}
+    getUserAgent() {
+      return Promise.resolve('Fake user agent');
+    }
   };
   const EmulationMock = class extends Connection {
-    sendCommand(command) {
+    sendCommand(command, params) {
       let fn = null;
       switch (command) {
         case 'Network.emulateNetworkConditions':
@@ -73,32 +69,40 @@ function getMockedEmulationDriver(emulationFn, netThrottleFn, cpuThrottleFn) {
         case 'Emulation.setDeviceMetricsOverride':
           fn = emulationFn;
           break;
+        case 'Network.setBlockedURLs':
+          fn = blockUrlFn;
+          break;
+        case 'Network.setExtraHTTPHeaders':
+          fn = extraHeadersFn;
+          break;
         default:
           fn = null;
           break;
       }
-      return Promise.resolve(fn && fn());
+      return Promise.resolve(fn && fn(params));
     }
   };
   return new EmulationDriver(new EmulationMock());
 }
 
 describe('GatherRunner', function() {
-  it('loads a page', () => {
+  it('loads a page and updates URL on redirect', () => {
+    const url1 = 'https://example.com';
+    const url2 = 'https://example.com/interstitial';
     const driver = {
       gotoURL() {
-        return Promise.resolve(true);
+        return Promise.resolve(url2);
       },
-      beginNetworkCollect() {
-        return Promise.resolve();
-      }
     };
 
-    return GatherRunner.loadPage(driver, {
+    const options = {
+      url: url1,
       flags: {},
-      config: {}
-    }).then(res => {
-      assert.equal(res, true);
+      config: {},
+    };
+
+    return GatherRunner.loadPage(driver, options).then(_ => {
+      assert.equal(options.url, url2);
     });
   });
 
@@ -110,6 +114,17 @@ describe('GatherRunner', function() {
 
     return GatherRunner.run([], options).then(_ => {
       assert.equal(typeof options.flags, 'object');
+    });
+  });
+
+  it('collects user agent as an artifact', () => {
+    const url = 'https://example.com';
+    const driver = fakeDriver;
+    const config = new Config({});
+    const options = {url, driver, config};
+
+    return GatherRunner.run([], options).then(results => {
+      assert.equal(results.UserAgent, 'Fake user agent', 'did not find expected user agent string');
     });
   });
 
@@ -130,8 +145,8 @@ describe('GatherRunner', function() {
       createEmulationCheck('calledCpuEmulation')
     );
 
-    return GatherRunner.setupDriver(driver, {
-      flags: {}
+    return GatherRunner.setupDriver(driver, {}, {
+      flags: {},
     }).then(_ => {
       assert.equal(tests.calledDeviceEmulation, true);
       assert.equal(tests.calledNetworkEmulation, true);
@@ -155,10 +170,10 @@ describe('GatherRunner', function() {
       createEmulationCheck('calledCpuEmulation', true)
     );
 
-    return GatherRunner.setupDriver(driver, {
+    return GatherRunner.setupDriver(driver, {}, {
       flags: {
         disableDeviceEmulation: true,
-      }
+      },
     }).then(_ => {
       assert.equal(tests.calledDeviceEmulation, false);
       assert.equal(tests.calledNetworkEmulation, true);
@@ -172,8 +187,8 @@ describe('GatherRunner', function() {
       calledNetworkEmulation: false,
       calledCpuEmulation: false,
     };
-    const createEmulationCheck = variable => () => {
-      tests[variable] = true;
+    const createEmulationCheck = variable => (...args) => {
+      tests[variable] = args;
       return true;
     };
     const driver = getMockedEmulationDriver(
@@ -182,14 +197,16 @@ describe('GatherRunner', function() {
       createEmulationCheck('calledCpuEmulation')
     );
 
-    return GatherRunner.setupDriver(driver, {
+    return GatherRunner.setupDriver(driver, {}, {
       flags: {
         disableNetworkThrottling: true,
-      }
+      },
     }).then(_ => {
-      assert.equal(tests.calledDeviceEmulation, true);
-      assert.equal(tests.calledNetworkEmulation, false);
-      assert.equal(tests.calledCpuEmulation, true);
+      assert.ok(tests.calledDeviceEmulation, 'called device emulation');
+      assert.deepEqual(tests.calledNetworkEmulation, [{
+        latency: 0, downloadThroughput: 0, uploadThroughput: 0, offline: false,
+      }]);
+      assert.ok(tests.calledCpuEmulation, 'called CPU emulation');
     });
   });
 
@@ -199,8 +216,8 @@ describe('GatherRunner', function() {
       calledNetworkEmulation: false,
       calledCpuEmulation: false,
     };
-    const createEmulationCheck = variable => () => {
-      tests[variable] = true;
+    const createEmulationCheck = variable => (...args) => {
+      tests[variable] = args;
       return true;
     };
     const driver = getMockedEmulationDriver(
@@ -209,15 +226,176 @@ describe('GatherRunner', function() {
       createEmulationCheck('calledCpuEmulation')
     );
 
-    return GatherRunner.setupDriver(driver, {
+    return GatherRunner.setupDriver(driver, {}, {
       flags: {
         disableCpuThrottling: true,
-      }
+      },
     }).then(_ => {
-      assert.equal(tests.calledDeviceEmulation, true);
-      assert.equal(tests.calledNetworkEmulation, true);
-      assert.equal(tests.calledCpuEmulation, false);
+      assert.ok(tests.calledDeviceEmulation, 'called device emulation');
+      assert.ok(tests.calledNetworkEmulation, 'called network emulation');
+      assert.deepEqual(tests.calledCpuEmulation, [{rate: 1}]);
     });
+  });
+
+  it('clears origin storage', () => {
+    const asyncFunc = () => Promise.resolve();
+    const tests = {
+      calledCleanBrowserCaches: false,
+      calledClearStorage: false,
+    };
+    const createCheck = variable => () => {
+      tests[variable] = true;
+      return Promise.resolve();
+    };
+    const driver = {
+      assertNoSameOriginServiceWorkerClients: asyncFunc,
+      beginEmulation: asyncFunc,
+      setThrottling: asyncFunc,
+      dismissJavaScriptDialogs: asyncFunc,
+      enableRuntimeEvents: asyncFunc,
+      cacheNatives: asyncFunc,
+      registerPerformanceObserver: asyncFunc,
+      cleanBrowserCaches: createCheck('calledCleanBrowserCaches'),
+      clearDataForOrigin: createCheck('calledClearStorage'),
+      blockUrlPatterns: asyncFunc,
+      setExtraHTTPHeaders: asyncFunc,
+      getUserAgent: () => Promise.resolve('Fake user agent'),
+    };
+
+    return GatherRunner.setupDriver(driver, {}, {flags: {}}).then(_ => {
+      assert.equal(tests.calledCleanBrowserCaches, false);
+      assert.equal(tests.calledClearStorage, true);
+    });
+  });
+
+  it('clears the disk & memory cache on a perf run', () => {
+    const asyncFunc = () => Promise.resolve();
+    const tests = {
+      calledCleanBrowserCaches: false,
+    };
+    const createCheck = variable => () => {
+      tests[variable] = true;
+      return Promise.resolve();
+    };
+    const driver = {
+      beginDevtoolsLog: asyncFunc,
+      beginTrace: asyncFunc,
+      gotoURL: asyncFunc,
+      cleanBrowserCaches: createCheck('calledCleanBrowserCaches'),
+    };
+    const config = {
+      recordTrace: true,
+      useThrottling: true,
+      gatherers: [],
+    };
+    const flags = {
+      disableStorageReset: false,
+    };
+    return GatherRunner.pass({driver, config, flags}, {TestGatherer: []}).then(_ => {
+      assert.equal(tests.calledCleanBrowserCaches, true);
+    });
+  });
+
+  it('does not clear origin storage with flag --disable-storage-reset', () => {
+    const asyncFunc = () => Promise.resolve();
+    const tests = {
+      calledCleanBrowserCaches: false,
+      calledClearStorage: false,
+    };
+    const createCheck = variable => () => {
+      tests[variable] = true;
+      return Promise.resolve();
+    };
+    const driver = {
+      assertNoSameOriginServiceWorkerClients: asyncFunc,
+      beginEmulation: asyncFunc,
+      setThrottling: asyncFunc,
+      dismissJavaScriptDialogs: asyncFunc,
+      enableRuntimeEvents: asyncFunc,
+      cacheNatives: asyncFunc,
+      registerPerformanceObserver: asyncFunc,
+      cleanBrowserCaches: createCheck('calledCleanBrowserCaches'),
+      clearDataForOrigin: createCheck('calledClearStorage'),
+      blockUrlPatterns: asyncFunc,
+      setExtraHTTPHeaders: asyncFunc,
+      getUserAgent: () => Promise.resolve('Fake user agent'),
+    };
+
+    return GatherRunner.setupDriver(driver, {}, {
+      flags: {disableStorageReset: true},
+    }).then(_ => {
+      assert.equal(tests.calledCleanBrowserCaches, false);
+      assert.equal(tests.calledClearStorage, false);
+    });
+  });
+
+  it('tells the driver to block given URL patterns when blockedUrlPatterns is given', () => {
+    let receivedUrlPatterns = null;
+    const driver = getMockedEmulationDriver(null, null, null, params => {
+      receivedUrlPatterns = params.urls;
+    });
+
+    return GatherRunner.beforePass({
+      driver,
+      flags: {
+        blockedUrlPatterns: ['http://*.evil.com', '.jpg', '.woff2'],
+      },
+      config: {
+        blockedUrlPatterns: ['*.jpeg'],
+        gatherers: [],
+      },
+    }).then(() => assert.deepStrictEqual(
+      receivedUrlPatterns.sort(),
+      ['*.jpeg', '.jpg', '.woff2', 'http://*.evil.com']
+    ));
+  });
+
+  it('does not throw when blockedUrlPatterns is not given', () => {
+    let receivedUrlPatterns = null;
+    const driver = getMockedEmulationDriver(null, null, null, params => {
+      receivedUrlPatterns = params.urls;
+    });
+
+    return GatherRunner.beforePass({
+      driver,
+      flags: {},
+      config: {gatherers: []},
+    }).then(() => assert.deepStrictEqual(receivedUrlPatterns, []));
+  });
+
+
+  it('tells the driver to set additional http headers when extraHeaders flag is given', () => {
+    let receivedHeaders = null;
+    const driver = getMockedEmulationDriver(null, null, null, null, params => {
+      receivedHeaders = params.headers;
+    });
+    const headers = {
+      'Cookie': 'monster',
+      'x-men': 'wolverine',
+    };
+
+    return GatherRunner.beforePass({
+      driver,
+      flags: {
+        extraHeaders: headers,
+      },
+      config: {gatherers: []},
+    }).then(() => assert.deepStrictEqual(
+        receivedHeaders,
+        headers
+      ));
+  });
+
+  it('returns an empty object if a falsey value is passed in to extraHeaders', () => {
+    const driver = getMockedEmulationDriver(null, null, null, null, params => params.headers);
+
+    return GatherRunner.beforePass({
+      driver,
+      flags: {
+        extraHeaders: undefined,
+      },
+      config: {gatherers: []},
+    }).then((returnValue) => assert.deepStrictEqual(returnValue, {}));
   });
 
   it('tells the driver to begin tracing', () => {
@@ -227,91 +405,99 @@ describe('GatherRunner', function() {
         calledTrace = true;
         return Promise.resolve();
       },
+      beginDevtoolsLog() {
+        return Promise.resolve();
+      },
       gotoURL() {
         return Promise.resolve();
       },
-      beginNetworkCollect() {
-        return Promise.resolve();
-      }
     };
 
     const config = {
       recordTrace: true,
-      gatherers: [{}]
+      gatherers: [
+        {instance: new TestGatherer()},
+      ],
     };
+    const flags = {};
 
-    return GatherRunner.loadPage(driver, {config}).then(_ => {
+    return GatherRunner.pass({driver, config, flags}, {TestGatherer: []}).then(_ => {
       assert.equal(calledTrace, true);
     });
   });
 
   it('tells the driver to end tracing', () => {
+    const url = 'https://example.com';
     let calledTrace = false;
     const fakeTraceData = {traceEvents: ['reallyBelievableTraceEvents']};
-    const driver = {
+
+    const driver = Object.assign({}, fakeDriver, {
       endTrace() {
         calledTrace = true;
         return Promise.resolve(fakeTraceData);
       },
-      endNetworkCollect() {
-        return Promise.resolve();
-      }
-    };
+    });
 
     const config = {
       recordTrace: true,
       gatherers: [
-        new TestGatherer()
-      ]
+        {instance: new TestGatherer()},
+      ],
     };
 
-    return GatherRunner.afterPass({driver, config}, {TestGatherer: []}).then(passData => {
+    return GatherRunner.afterPass({url, driver, config}, {TestGatherer: []}).then(passData => {
       assert.equal(calledTrace, true);
       assert.equal(passData.trace, fakeTraceData);
     });
   });
 
-  it('tells the driver to begin network collection', () => {
-    let calledNetworkCollect = false;
+  it('tells the driver to begin devtoolsLog collection', () => {
+    let calledDevtoolsLogCollect = false;
     const driver = {
-      beginNetworkCollect() {
-        calledNetworkCollect = true;
+      beginDevtoolsLog() {
+        calledDevtoolsLogCollect = true;
         return Promise.resolve();
       },
       gotoURL() {
         return Promise.resolve();
-      }
+      },
     };
 
     const config = {
-      recordNetwork: true,
-      gatherers: [{}]
+      gatherers: [
+        {instance: new TestGatherer()},
+      ],
     };
+    const flags = {};
 
-    return GatherRunner.loadPage(driver, {config}).then(_ => {
-      assert.equal(calledNetworkCollect, true);
+    return GatherRunner.pass({driver, config, flags}, {TestGatherer: []}).then(_ => {
+      assert.equal(calledDevtoolsLogCollect, true);
     });
   });
 
-  it('tells the driver to end network collection', () => {
-    let calledNetworkCollect = false;
-    const driver = {
-      endNetworkCollect() {
-        calledNetworkCollect = true;
-        return Promise.resolve({x: 1});
-      }
-    };
+  it('tells the driver to end devtoolsLog collection', () => {
+    const url = 'https://example.com';
+    let calledDevtoolsLogCollect = false;
+
+    const fakeDevtoolsMessage = {method: 'Network.FakeThing', params: {}};
+    const driver = Object.assign({}, fakeDriver, {
+      endDevtoolsLog() {
+        calledDevtoolsLogCollect = true;
+        return [
+          fakeDevtoolsMessage,
+        ];
+      },
+    });
 
     const config = {
-      recordNetwork: true,
       gatherers: [
-        new TestGatherer()
-      ]
+        {instance: new TestGatherer()},
+      ],
     };
 
-    return GatherRunner.afterPass({driver, config}, {TestGatherer: []}).then(vals => {
-      assert.equal(calledNetworkCollect, true);
-      assert.deepEqual(vals.networkRecords, {x: 1});
+    return GatherRunner.afterPass({url, driver, config}, {TestGatherer: []}).then(vals => {
+      assert.equal(calledDevtoolsLogCollect, true);
+      assert.strictEqual(vals.devtoolsLog[0], fakeDevtoolsMessage);
     });
   });
 
@@ -337,24 +523,25 @@ describe('GatherRunner', function() {
     const flags = {};
 
     const passes = [{
-      recordNetwork: true,
+      blankDuration: 0,
       recordTrace: true,
       passName: 'firstPass',
       gatherers: [
-        t1
-      ]
+        {instance: t1},
+      ],
     }, {
+      blankDuration: 0,
       passName: 'secondPass',
       gatherers: [
-        t2
-      ]
+        {instance: t2},
+      ],
     }];
 
     return GatherRunner.run(passes, {
       driver: fakeDriver,
       url: 'https://example.com',
       flags,
-      config
+      config,
     }).then(_ => {
       assert.ok(t1.called);
       assert.ok(t2.called);
@@ -363,122 +550,75 @@ describe('GatherRunner', function() {
 
   it('respects trace names', () => {
     const passes = [{
-      recordNetwork: true,
+      blankDuration: 0,
       recordTrace: true,
       passName: 'firstPass',
-      gatherers: [new TestGatherer()]
+      gatherers: [{instance: new TestGatherer()}],
     }, {
-      recordNetwork: true,
+      blankDuration: 0,
       recordTrace: true,
       passName: 'secondPass',
-      gatherers: [new TestGatherer()]
+      gatherers: [{instance: new TestGatherer()}],
     }];
     const options = {driver: fakeDriver, url: 'https://example.com', flags: {}, config: {}};
 
     return GatherRunner.run(passes, options)
       .then(artifacts => {
         assert.ok(artifacts.traces.firstPass);
-        assert.ok(artifacts.networkRecords.firstPass);
+        assert.ok(artifacts.devtoolsLogs.firstPass);
         assert.ok(artifacts.traces.secondPass);
-        assert.ok(artifacts.networkRecords.secondPass);
+        assert.ok(artifacts.devtoolsLogs.secondPass);
       });
   });
 
-  it('loads gatherers from custom paths', () => {
-    const root = path.resolve(__dirname, '../fixtures');
-
-    assert.doesNotThrow(_ => GatherRunner.getGathererClass(`${root}/valid-custom-gatherer`));
-    return assert.doesNotThrow(_ => GatherRunner.getGathererClass('valid-custom-gatherer', root));
-  });
-
-  it('returns gatherer when gatherer class, not package-name string, is provided', () => {
-    assert.equal(GatherRunner.getGathererClass(TestGatherer, '.'), TestGatherer);
-  });
-
-  it('throws when a gatherer is not found', () => {
-    return assert.throws(_ => GatherRunner.getGathererClass(
-        '/fake-path/non-existent-gatherer'), /locate gatherer/);
-  });
-
-  it('loads a gatherer relative to a config path', () => {
-    const configPath = __dirname;
-
-    return assert.doesNotThrow(_ =>
-        GatherRunner.getGathererClass('../fixtures/valid-custom-gatherer', configPath));
-  });
-
-  it('loads a gatherer from node_modules/', () => {
-    return assert.throws(_ => GatherRunner.getGathererClass(
-        // Use a lighthouse dep as a stand in for a module.
-        'mocha'
-    ), function(err) {
-      // Should throw a gatherer validation error, but *not* a gatherer not found error.
-      return !/locate gatherer/.test(err) && /beforePass\(\) method/.test(err);
-    });
-  });
-
-  it('loads a gatherer relative to the working directory', () => {
-    // Construct a gatherer URL relative to current working directory,
-    // regardless of where test was started from.
-    const absoluteGathererPath = path.resolve(__dirname, '../fixtures/valid-custom-gatherer');
-    assert.doesNotThrow(_ => require.resolve(absoluteGathererPath));
-    const relativeGathererPath = path.relative(process.cwd(), absoluteGathererPath);
-
-    return assert.doesNotThrow(_ =>
-        GatherRunner.getGathererClass(relativeGathererPath));
-  });
-
-  it('throws but not for missing gatherer when it has a dependency error', () => {
-    const gathererPath = path.resolve(__dirname, '../fixtures/invalid-gatherers/require-error.js');
-    return assert.throws(_ => GatherRunner.getGathererClass(gathererPath),
-        function(err) {
-          // We're expecting not to find parent class Gatherer, so only reject on
-          // our own custom locate gatherer error, not the usual MODULE_NOT_FOUND.
-          return !/locate gatherer/.test(err) && err.code === 'MODULE_NOT_FOUND';
-        });
-  });
-
-  it('throws for invalid gatherers', () => {
-    const root = path.resolve(__dirname, '../fixtures/invalid-gatherers');
-
-    assert.throws(_ => GatherRunner.getGathererClass('missing-before-pass', root),
-      /beforePass\(\) method/);
-
-    assert.throws(_ => GatherRunner.getGathererClass('missing-pass', root),
-      /pass\(\) method/);
-
-    assert.throws(_ => GatherRunner.getGathererClass('missing-after-pass', root),
-      /afterPass\(\) method/);
-  });
-
-  it('can create computed artifacts', () => {
-    const computedArtifacts = GatherRunner.instantiateComputedArtifacts();
-    assert.ok(Object.keys(computedArtifacts).length, 'there are a few computed artifacts');
-    Object.keys(computedArtifacts).forEach(artifactRequest => {
-      assert.equal(typeof computedArtifacts[artifactRequest], 'function');
-    });
-  });
-
-  it('will instantiate computed artifacts during a run', () => {
+  it('doesn\'t leave networkRecords as an artifact', () => {
     const passes = [{
-      recordNetwork: true,
+      blankDuration: 0,
       recordTrace: true,
       passName: 'firstPass',
-      gatherers: [new TestGatherer()]
+      gatherers: [{instance: new TestGatherer()}],
+    }, {
+      blankDuration: 0,
+      recordTrace: true,
+      passName: 'secondPass',
+      gatherers: [{instance: new TestGatherer()}],
     }];
     const options = {driver: fakeDriver, url: 'https://example.com', flags: {}, config: {}};
 
     return GatherRunner.run(passes, options)
-        .then(artifacts => {
-          const networkRecords = artifacts.networkRecords.firstPass;
-          const p = artifacts.requestCriticalRequestChains(networkRecords);
-          return p.then(chains => {
-            // fakeDriver will include networkRecords built from fixtures/perflog.json
-            assert.ok(chains['93149.1']);
-            assert.ok(chains['93149.1'].request);
-            assert.ok(chains['93149.1'].children);
-          });
-        });
+      .then(artifacts => {
+        assert.equal(artifacts.networkRecords, undefined);
+      });
+  });
+
+  describe('#getPageLoadError', () => {
+    it('passes when the page is loaded', () => {
+      const url = 'http://the-page.com';
+      const records = [{url}];
+      assert.ok(!GatherRunner.getPageLoadError(url, records));
+    });
+
+    it('passes when the page is loaded, ignoring any fragment', () => {
+      const url = 'http://example.com/#/page/list';
+      const records = [{url: 'http://example.com'}];
+      assert.ok(!GatherRunner.getPageLoadError(url, records));
+    });
+
+    it('throws when page fails to load', () => {
+      const url = 'http://the-page.com';
+      const records = [{url, failed: true, localizedFailDescription: 'foobar'}];
+      const error = GatherRunner.getPageLoadError(url, records);
+      assert.equal(error.message, 'FAILED_DOCUMENT_REQUEST');
+      assert.ok(/Your page failed to load/.test(error.friendlyMessage));
+    });
+
+    it('throws when page times out', () => {
+      const url = 'http://the-page.com';
+      const records = [];
+      const error = GatherRunner.getPageLoadError(url, records);
+      assert.equal(error.message, 'NO_DOCUMENT_REQUEST');
+      assert.ok(/Your page failed to load/.test(error.friendlyMessage));
+    });
   });
 
   describe('artifact collection', () => {
@@ -516,18 +656,19 @@ describe('GatherRunner', function() {
           afterPass() {
             return Promise.resolve(this.name);
           }
-        }()
-      ];
-      const gathererNames = gatherers.map(gatherer => gatherer.name);
+        }(),
+      ].map(instance => ({instance}));
+      const gathererNames = gatherers.map(gatherer => gatherer.instance.name);
       const passes = [{
-        gatherers
+        blankDuration: 0,
+        gatherers,
       }];
 
       return GatherRunner.run(passes, {
         driver: fakeDriver,
         url: 'https://example.com',
         flags: {},
-        config: new Config({})
+        config: new Config({}),
       }).then(artifacts => {
         gathererNames.forEach(gathererName => {
           assert.strictEqual(artifacts[gathererName], gathererName);
@@ -535,12 +676,51 @@ describe('GatherRunner', function() {
       });
     });
 
+    it('passes gatherer options', () => {
+      const calls = {beforePass: [], pass: [], afterPass: []};
+      class EavesdropGatherer extends Gatherer {
+        beforePass(context) {
+          calls.beforePass.push(context.options);
+        }
+        pass(context) {
+          calls.pass.push(context.options);
+        }
+        afterPass(context) {
+          calls.afterPass.push(context.options);
+          return context.options.x || 'none';
+        }
+      }
+
+      const gatherers = [
+        {instance: new class EavesdropGatherer1 extends EavesdropGatherer {}(), options: {x: 1}},
+        {instance: new class EavesdropGatherer2 extends EavesdropGatherer {}(), options: {x: 2}},
+        {instance: new class EavesdropGatherer3 extends EavesdropGatherer {}()},
+      ];
+
+      const passes = [{blankDuration: 0, gatherers}];
+      return GatherRunner.run(passes, {
+        driver: fakeDriver,
+        url: 'https://example.com',
+        flags: {},
+        config: new Config({}),
+      }).then(artifacts => {
+        assert.equal(artifacts.EavesdropGatherer1, 1);
+        assert.equal(artifacts.EavesdropGatherer2, 2);
+        assert.equal(artifacts.EavesdropGatherer3, 'none');
+
+        // assert that all three phases received the gatherer options expected
+        const expectedOptions = [{x: 1}, {x: 2}, {}];
+        for (let i = 0; i < 3; i++) {
+          assert.deepEqual(calls.beforePass[i], expectedOptions[i]);
+          assert.deepEqual(calls.pass[i], expectedOptions[i]);
+          assert.deepEqual(calls.afterPass[i], expectedOptions[i]);
+        }
+      });
+    });
+
     it('uses the last not-undefined phase result as artifact', () => {
       const recoverableError = new Error('My recoverable error');
-      recoverableError.recoverable = true;
-
       const someOtherError = new Error('Bad, bad error.');
-      someOtherError.recoverable = true;
 
       // Gatherer results are all expected to be arrays of promises
       const gathererResults = {
@@ -548,29 +728,31 @@ describe('GatherRunner', function() {
         AfterGatherer: [
           Promise.resolve(65),
           Promise.resolve(72),
-          Promise.resolve(97)
+          Promise.resolve(97),
         ],
 
         // 284 wins.
         PassGatherer: [
           Promise.resolve(220),
           Promise.resolve(284),
-          Promise.resolve(undefined)
+          Promise.resolve(undefined),
         ],
 
         // Error wins.
         SingleErrorGatherer: [
           Promise.reject(recoverableError),
           Promise.resolve(1184),
-          Promise.resolve(1210)
+          Promise.resolve(1210),
         ],
 
         // First error wins.
         TwoErrorGatherer: [
           Promise.reject(recoverableError),
           Promise.reject(someOtherError),
-          Promise.resolve(1729)
-        ]
+          Promise.resolve(1729),
+        ],
+
+        LighthouseRunWarnings: [],
       };
 
       return GatherRunner.collectArtifacts(gathererResults).then(artifacts => {
@@ -581,28 +763,38 @@ describe('GatherRunner', function() {
       });
     });
 
-    it('supports sync and async throwing of recoverable errors from gatherers', () => {
+    it('produces a LighthouseRunWarnings artifact from array of warnings', () => {
+      const LighthouseRunWarnings = [
+        'warning0',
+        'warning1',
+        'warning2',
+      ];
+
+      const gathererResults = {
+        LighthouseRunWarnings,
+      };
+
+      return GatherRunner.collectArtifacts(gathererResults).then(artifacts => {
+        assert.deepStrictEqual(artifacts.LighthouseRunWarnings, LighthouseRunWarnings);
+      });
+    });
+
+    it('supports sync and async throwing of non-fatal errors from gatherers', () => {
       const gatherers = [
         // sync
         new class BeforeSync extends Gatherer {
           beforePass() {
-            const err = new Error(this.name);
-            err.recoverable = true;
-            throw err;
+            throw new Error(this.name);
           }
         }(),
         new class PassSync extends Gatherer {
           pass() {
-            const err = new Error(this.name);
-            err.recoverable = true;
-            throw err;
+            throw new Error(this.name);
           }
         }(),
         new class AfterSync extends Gatherer {
           afterPass() {
-            const err = new Error(this.name);
-            err.recoverable = true;
-            throw err;
+            throw new Error(this.name);
           }
         }(),
 
@@ -610,35 +802,33 @@ describe('GatherRunner', function() {
         new class BeforePromise extends Gatherer {
           beforePass() {
             const err = new Error(this.name);
-            err.recoverable = true;
             return Promise.reject(err);
           }
         }(),
         new class PassPromise extends Gatherer {
           pass() {
             const err = new Error(this.name);
-            err.recoverable = true;
             return Promise.reject(err);
           }
         }(),
         new class AfterPromise extends Gatherer {
           afterPass() {
             const err = new Error(this.name);
-            err.recoverable = true;
             return Promise.reject(err);
           }
-        }()
-      ];
-      const gathererNames = gatherers.map(gatherer => gatherer.name);
+        }(),
+      ].map(instance => ({instance}));
+      const gathererNames = gatherers.map(gatherer => gatherer.instance.name);
       const passes = [{
-        gatherers
+        blankDuration: 0,
+        gatherers,
       }];
 
       return GatherRunner.run(passes, {
         driver: fakeDriver,
         url: 'https://example.com',
         flags: {},
-        config: new Config({})
+        config: new Config({}),
       }).then(artifacts => {
         gathererNames.forEach(gathererName => {
           const errorArtifact = artifacts[gathererName];
@@ -648,8 +838,10 @@ describe('GatherRunner', function() {
       });
     });
 
-    it('rejects if a gatherer returns an unrecoverable error', () => {
+    it('rejects if a gatherer returns a fatal error', () => {
       const errorMessage = 'Gather Failed in pass()';
+      const err = new Error(errorMessage);
+      err.fatal = true;
       const gatherers = [
         // sync
         new class GathererSuccess extends Gatherer {
@@ -659,19 +851,20 @@ describe('GatherRunner', function() {
         }(),
         new class GathererFailure extends Gatherer {
           pass() {
-            return Promise.reject(new Error(errorMessage));
+            return Promise.reject(err);
           }
-        }
-      ];
+        },
+      ].map(instance => ({instance}));
       const passes = [{
-        gatherers
+        blankDuration: 0,
+        gatherers,
       }];
 
       return GatherRunner.run(passes, {
         driver: fakeDriver,
         url: 'https://example.com',
         flags: {},
-        config: new Config({})
+        config: new Config({}),
       }).then(
         _ => assert.ok(false),
         err => assert.strictEqual(err.message, errorMessage));
@@ -679,20 +872,98 @@ describe('GatherRunner', function() {
 
     it('rejects if a gatherer does not provide an artifact', () => {
       const passes = [{
-        recordNetwork: true,
+        blankDuration: 0,
         recordTrace: true,
         passName: 'firstPass',
         gatherers: [
-          new TestGathererNoArtifact()
-        ]
+          {instance: new TestGathererNoArtifact()},
+        ],
       }];
 
       return GatherRunner.run(passes, {
         driver: fakeDriver,
         url: 'https://example.com',
         flags: {},
-        config: new Config({})
+        config: new Config({}),
       }).then(_ => assert.ok(false), _ => assert.ok(true));
     });
+
+    it('rejects when domain name can\'t be resolved', () => {
+      const passes = [{
+        blankDuration: 0,
+        recordTrace: true,
+        passName: 'firstPass',
+        gatherers: [],
+      }];
+
+      // Arrange for driver to return unresolved request.
+      const url = 'http://www.some-non-existing-domain.com/';
+      const unresolvedDriver = Object.assign({}, fakeDriver, {
+        online: true,
+        gotoURL() {
+          return Promise.resolve(url);
+        },
+        endDevtoolsLog() {
+          return unresolvedPerfLog;
+        },
+      });
+
+      return GatherRunner.run(passes, {
+        driver: unresolvedDriver,
+        url,
+        flags: {},
+        config: new Config({}),
+      }).then(artifacts => {
+        assert.equal(artifacts.LighthouseRunWarnings.length, 1);
+        assert.ok(/unable.*load the page/.test(artifacts.LighthouseRunWarnings[0]));
+      });
+    });
+
+    it('resolves when domain name can\'t be resolved but is offline', () => {
+      const passes = [{
+        blankDuration: 0,
+        recordTrace: true,
+        passName: 'firstPass',
+        gatherers: [],
+      }];
+
+      // Arrange for driver to return unresolved request.
+      const url = 'http://www.some-non-existing-domain.com/';
+      const unresolvedDriver = Object.assign({}, fakeDriver, {
+        online: false,
+        gotoURL() {
+          return Promise.resolve(url);
+        },
+        endDevtoolsLog() {
+          return unresolvedPerfLog;
+        },
+      });
+
+      return GatherRunner.run(passes, {
+        driver: unresolvedDriver,
+        url,
+        flags: {},
+        config: new Config({}),
+      })
+        .then(_ => {
+          assert.ok(true);
+        });
+    });
+  });
+
+  it('issues a lighthouseRunWarnings if running an old version of Headless', () => {
+    const gathererResults = {
+      LighthouseRunWarnings: [],
+    };
+
+    const userAgent = 'Mozilla/5.0 AppleWebKit/537.36 HeadlessChrome/63.0.3239.0 Safari/537.36';
+    GatherRunner.warnOnHeadless(userAgent, gathererResults);
+    assert.strictEqual(gathererResults.LighthouseRunWarnings.length, 0);
+
+    const oldUserAgent = 'Mozilla/5.0 AppleWebKit/537.36 HeadlessChrome/62.0.3239.0 Safari/537.36';
+    GatherRunner.warnOnHeadless(oldUserAgent, gathererResults);
+    assert.strictEqual(gathererResults.LighthouseRunWarnings.length, 1);
+    const warning = gathererResults.LighthouseRunWarnings[0];
+    assert.ok(/Headless Chrome/.test(warning));
   });
 });

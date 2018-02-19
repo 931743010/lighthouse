@@ -1,30 +1,19 @@
 /**
- * @license
- * Copyright 2016 Google Inc. All rights reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * @license Copyright 2016 Google Inc. All Rights Reserved.
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License. You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
+ * Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.
  */
-
 'use strict';
 
 const Audit = require('./audit');
-const TracingProcessor = require('../lib/traces/tracing-processor');
-const Formatter = require('../formatters/formatter');
+const Util = require('../report/v2/renderer/util');
+const LHError = require('../lib/errors');
 
 // Parameters (in ms) for log-normal CDF scoring. To see the curve:
 // https://www.desmos.com/calculator/joz3pqttdq
 const SCORING_POINT_OF_DIMINISHING_RETURNS = 1600;
 const SCORING_MEDIAN = 4000;
+
 
 class FirstMeaningfulPaint extends Audit {
   /**
@@ -32,12 +21,12 @@ class FirstMeaningfulPaint extends Audit {
    */
   static get meta() {
     return {
-      category: 'Performance',
       name: 'first-meaningful-paint',
       description: 'First meaningful paint',
-      optimalValue: SCORING_POINT_OF_DIMINISHING_RETURNS.toLocaleString() + 'ms',
-      helpText: 'First meaningful paint measures when the primary content of a page is visible. <a href="https://developers.google.com/web/tools/lighthouse/audits/first-meaningful-paint" target="_blank" rel="noopener">Learn more</a>.',
-      requiredArtifacts: ['traces']
+      helpText: 'First meaningful paint measures when the primary content of a page is visible. ' +
+          '[Learn more](https://developers.google.com/web/tools/lighthouse/audits/first-meaningful-paint).',
+      scoringMode: Audit.SCORING_MODES.NUMERIC,
+      requiredArtifacts: ['traces'],
     };
   }
 
@@ -49,103 +38,78 @@ class FirstMeaningfulPaint extends Audit {
    * @return {!Promise<!AuditResult>} The score from the audit, ranging from 0-100.
    */
   static audit(artifacts) {
-    return new Promise((resolve, reject) => {
-      const traceContents = artifacts.traces[this.DEFAULT_PASS].traceEvents;
-      const evts = this.collectEvents(traceContents);
-      const result = this.calculateScore(evts);
+    const trace = artifacts.traces[this.DEFAULT_PASS];
+    return artifacts.requestTraceOfTab(trace).then(tabTrace => {
+      if (!tabTrace.firstMeaningfulPaintEvt) {
+        throw new LHError(LHError.errors.NO_FMP);
+      }
 
-      resolve(FirstMeaningfulPaint.generateAuditResult({
+      // navigationStart is currently essential to FMP calculation.
+      // see: https://github.com/GoogleChrome/lighthouse/issues/753
+      if (!tabTrace.navigationStartEvt) {
+        throw new LHError(LHError.errors.NO_NAVSTART);
+      }
+
+      const result = this.calculateScore(tabTrace);
+
+      return {
         score: result.score,
         rawValue: parseFloat(result.duration),
-        displayValue: `${result.duration}ms`,
+        displayValue: Util.formatMilliseconds(result.duration),
         debugString: result.debugString,
-        optimalValue: this.meta.optimalValue,
         extendedInfo: {
           value: result.extendedInfo,
-          formatter: Formatter.SUPPORTED_FORMATS.NULL
-        }
-      }));
-    }).catch(err => {
-      // Recover from trace parsing failures.
-      return FirstMeaningfulPaint.generateAuditResult({
-        rawValue: -1,
-        debugString: err.message
-      });
+        },
+      };
     });
   }
 
-  static calculateScore(evts) {
-    const firstMeaningfulPaint = (evts.firstMeaningfulPaint.ts - evts.navigationStart.ts) / 1000;
-    const firstContentfulPaint = (evts.firstContentfulPaint.ts - evts.navigationStart.ts) / 1000;
-
+  static calculateScore(traceOfTab) {
     // Expose the raw, unchanged monotonic timestamps from the trace, along with timing durations
     const extendedInfo = {
       timestamps: {
-        navStart: evts.navigationStart.ts,
-        fCP: evts.firstContentfulPaint.ts,
-        fMP: evts.firstMeaningfulPaint.ts
+        navStart: traceOfTab.timestamps.navigationStart,
+        fCP: traceOfTab.timestamps.firstContentfulPaint,
+        fMP: traceOfTab.timestamps.firstMeaningfulPaint,
+        onLoad: traceOfTab.timestamps.onLoad,
+        endOfTrace: traceOfTab.timestamps.traceEnd,
       },
       timings: {
         navStart: 0,
-        fCP: parseFloat(firstContentfulPaint.toFixed(3)),
-        fMP: parseFloat(firstMeaningfulPaint.toFixed(3))
-      }
+        fCP: traceOfTab.timings.firstContentfulPaint,
+        fMP: traceOfTab.timings.firstMeaningfulPaint,
+        onLoad: traceOfTab.timings.onLoad,
+        endOfTrace: traceOfTab.timings.traceEnd,
+      },
+      fmpFellBack: traceOfTab.fmpFellBack,
     };
+
+    Object.keys(extendedInfo.timings).forEach(key => {
+      const val = extendedInfo.timings[key];
+      if (typeof val !== 'number' || Number.isNaN(val)) {
+        extendedInfo.timings[key] = undefined;
+        extendedInfo.timestamps[key] = undefined;
+      } else {
+        extendedInfo.timings[key] = parseFloat(extendedInfo.timings[key].toFixed(3));
+      }
+    });
 
     // Use the CDF of a log-normal distribution for scoring.
     //   < 1100ms: score≈100
     //   4000ms: score=50
     //   >= 14000ms: score≈0
-    const distribution = TracingProcessor.getLogNormalDistribution(SCORING_MEDIAN,
-        SCORING_POINT_OF_DIMINISHING_RETURNS);
-    let score = 100 * distribution.computeComplementaryPercentile(firstMeaningfulPaint);
-
-    // Clamp the score to 0 <= x <= 100.
-    score = Math.min(100, score);
-    score = Math.max(0, score);
-
-    return {
-      duration: `${firstMeaningfulPaint.toFixed(1)}`,
-      score: Math.round(score),
-      rawValue: parseFloat(firstMeaningfulPaint.toFixed(1)),
-      extendedInfo
-    };
-  }
-
-  /**
-   * @param {!Array<!Object>} traceData
-   */
-  static collectEvents(traceData) {
-    // Parse the trace for our key events and sort them by timestamp.
-    const events = traceData.filter(e => {
-      return e.cat.includes('blink.user_timing') || e.name === 'TracingStartedInPage';
-    }).sort((event0, event1) => event0.ts - event1.ts);
-
-    // The first TracingStartedInPage in the trace is definitely our renderer thread of interest
-    // Beware: the tracingStartedInPage event can appear slightly after a navigationStart
-    const startedInPageEvt = events.find(e => e.name === 'TracingStartedInPage');
-    // Filter to just events matching the frame ID for sanity
-    const frameEvents = events.filter(e => e.args.frame === startedInPageEvt.args.data.page);
-
-    // Find our first FCP
-    const firstFCP = frameEvents.find(e => e.name === 'firstContentfulPaint');
-    // Our navStart will be the latest one before fCP.
-    const navigationStart = frameEvents.filter(e =>
-        e.name === 'navigationStart' && e.ts < firstFCP.ts).pop();
-    // FMP will follow at/after the FCP
-    const firstMeaningfulPaint = frameEvents.find(e =>
-        e.name === 'firstMeaningfulPaint' && e.ts >= firstFCP.ts);
-
-    // navigationStart is currently essential to FMP calculation.
-    // see: https://github.com/GoogleChrome/lighthouse/issues/753
-    if (!navigationStart) {
-      throw new Error('No `navigationStart` event found in trace');
-    }
-
-    return {
-      navigationStart,
+    const firstMeaningfulPaint = traceOfTab.timings.firstMeaningfulPaint;
+    const score = Audit.computeLogNormalScore(
       firstMeaningfulPaint,
-      firstContentfulPaint: firstFCP
+      SCORING_POINT_OF_DIMINISHING_RETURNS,
+      SCORING_MEDIAN
+    );
+
+    return {
+      score,
+      duration: firstMeaningfulPaint.toFixed(1),
+      rawValue: firstMeaningfulPaint,
+      extendedInfo,
     };
   }
 }

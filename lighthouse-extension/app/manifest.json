@@ -1,7 +1,7 @@
 {
   "name": "__MSG_appName__",
-  "version": "1.3.1",
-  "minimum_chrome_version": "54",
+  "version": "2.9.1",
+  "minimum_chrome_version": "56",
   "manifest_version": 2,
   "description": "__MSG_appDescription__",
   "icons": {
@@ -12,8 +12,9 @@
   "background": {
     "scripts": [
       "scripts/chromereload.js",
-      "scripts/lighthouse-background.js"
-    ]
+      "scripts/lighthouse-ext-background.js"
+    ],
+    "persistent": false
   },
   "permissions": [
     "activeTab",

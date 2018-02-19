@@ -1,18 +1,7 @@
 /**
- * @license
- * Copyright 2016 Google Inc. All rights reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * @license Copyright 2016 Google Inc. All Rights Reserved.
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License. You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
+ * Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.
  */
 
 /**
@@ -25,10 +14,8 @@
 const URL = require('../../lib/url-shim');
 const Audit = require('../audit');
 const EventHelpers = require('../../lib/event-helpers');
-const Formatter = require('../../formatters/formatter');
 
 class NoMutationEventsAudit extends Audit {
-
   static get MUTATION_EVENTS() {
     return [
       'DOMAttrModified',
@@ -39,7 +26,7 @@ class NoMutationEventsAudit extends Audit {
       'DOMNodeInsertedIntoDocument',
       'DOMNodeRemoved',
       'DOMNodeRemovedFromDocument',
-      'DOMSubtreeModified'
+      'DOMSubtreeModified',
     ];
   }
 
@@ -48,13 +35,12 @@ class NoMutationEventsAudit extends Audit {
    */
   static get meta() {
     return {
-      category: 'JavaScript',
       name: 'no-mutation-events',
-      description: 'Site does not use Mutation Events in its own scripts',
+      description: 'Avoids Mutation Events in its own scripts',
+      failureDescription: 'Uses Mutation Events in its own scripts',
       helpText: 'Mutation Events are deprecated and harm performance. Consider using Mutation ' +
-          'Observers instead. <a href="https://developers.google.com/web/tools/lighthouse' +
-          '/audits/mutation-events" target="_blank" rel="noopener">Learn more</a>.',
-      requiredArtifacts: ['URL', 'EventListeners']
+          'Observers instead. [Learn more](https://developers.google.com/web/tools/lighthouse/audits/mutation-events).',
+      requiredArtifacts: ['URL', 'EventListeners'],
     };
   }
 
@@ -63,29 +49,42 @@ class NoMutationEventsAudit extends Audit {
    * @return {!AuditResult}
    */
   static audit(artifacts) {
-    if (artifacts.EventListeners.rawValue === -1) {
-      return NoMutationEventsAudit.generateAuditResult(artifacts.EventListeners);
-    }
-
+    let debugString;
     const listeners = artifacts.EventListeners;
 
-    const pageHost = new URL(artifacts.URL.finalUrl).host;
-
     const results = listeners.filter(loc => {
-      const isMutationEvent = this.MUTATION_EVENTS.indexOf(loc.type) !== -1;
-      const sameHost = loc.url ? new URL(loc.url).host === pageHost : true;
+      const isMutationEvent = this.MUTATION_EVENTS.includes(loc.type);
+      let sameHost = URL.hostsMatch(artifacts.URL.finalUrl, loc.url);
+
+      if (!URL.isValid(loc.url) && isMutationEvent) {
+        sameHost = true;
+        debugString = URL.INVALID_URL_DEBUG_STRING;
+      }
+
       return sameHost && isMutationEvent;
     }).map(EventHelpers.addFormattedCodeSnippet);
 
     const groupedResults = EventHelpers.groupCodeSnippetsByLocation(results);
 
-    return NoMutationEventsAudit.generateAuditResult({
+    const headings = [
+      {key: 'url', itemType: 'url', text: 'URL'},
+      {key: 'type', itemType: 'code', text: 'Event'},
+      {key: 'line', itemType: 'text', text: 'Line'},
+      {key: 'col', itemType: 'text', text: 'Col'},
+      {key: 'pre', itemType: 'code', text: 'Snippet'},
+    ];
+    const details = NoMutationEventsAudit.makeTableDetails(headings, groupedResults);
+
+    return {
       rawValue: groupedResults.length === 0,
       extendedInfo: {
-        formatter: Formatter.SUPPORTED_FORMATS.URLLIST,
-        value: groupedResults
-      }
-    });
+        value: {
+          results: groupedResults,
+        },
+      },
+      details,
+      debugString,
+    };
   }
 }
 

@@ -1,32 +1,30 @@
 /**
- * Copyright 2016 Google Inc. All rights reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * @license Copyright 2016 Google Inc. All Rights Reserved.
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License. You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
+ * Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.
  */
-
 'use strict';
 
-const recordsFromLogs = require('../../lib/network-recorder').recordsFromLogs;
-
 module.exports = {
+  getUserAgent() {
+    return Promise.resolve('Fake user agent');
+  },
   connect() {
     return Promise.resolve();
   },
-  disconnect() {},
-  gotoURL() {
+  disconnect() {
     return Promise.resolve();
   },
+  gotoURL() {
+    return Promise.resolve('https://www.reddit.com/r/nba');
+  },
   beginEmulation() {
+    return Promise.resolve();
+  },
+  setThrottling() {
+    return Promise.resolve();
+  },
+  dismissJavaScriptDialogs() {
     return Promise.resolve();
   },
   assertNoSameOriginServiceWorkerClients() {
@@ -41,9 +39,15 @@ module.exports = {
   evaluateScriptOnLoad() {
     return Promise.resolve();
   },
-  cleanAndDisableBrowserCaches() {},
+  cleanBrowserCaches() {},
   clearDataForOrigin() {},
   cacheNatives() {
+    return Promise.resolve();
+  },
+  evaluateAsync() {
+    return Promise.resolve({});
+  },
+  registerPerformanceObserver() {
     return Promise.resolve();
   },
   beginTrace() {
@@ -54,15 +58,19 @@ module.exports = {
       require('../fixtures/traces/progressive-app.json')
     );
   },
-  beginNetworkCollect() {},
-  endNetworkCollect() {
-    return Promise.resolve(
-      recordsFromLogs(require('../fixtures/perflog.json'))
-    );
+  beginDevtoolsLog() {},
+  endDevtoolsLog() {
+    return require('../fixtures/perflog.json');
   },
   getSecurityState() {
     return Promise.resolve({
-      schemeIsCryptographic: true
+      schemeIsCryptographic: true,
     });
-  }
+  },
+  blockUrlPatterns() {
+    return Promise.resolve();
+  },
+  setExtraHTTPHeaders() {
+    return Promise.resolve();
+  },
 };

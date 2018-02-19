@@ -1,23 +1,14 @@
 /**
- * @license
- * Copyright 2016 Google Inc. All rights reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * @license Copyright 2016 Google Inc. All Rights Reserved.
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License. You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
+ * Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.
  */
 'use strict';
 
 const Gatherer = require('./gatherer');
 const manifestParser = require('../../lib/manifest-parser');
+const BOM_LENGTH = 3;
+const BOM_FIRSTCHAR = 65279;
 
 /**
  * Uses the debugger protocol to fetch the manifest from within the context of
@@ -26,37 +17,28 @@ const manifestParser = require('../../lib/manifest-parser');
  * the manifest parser.
  */
 class Manifest extends Gatherer {
-
-  static _errorManifest(errorString) {
-    return {
-      raw: undefined,
-      value: undefined,
-      debugString: errorString
-    };
-  }
-
+  /**
+   * Returns the parsed manifest or null if the page had no manifest. If the manifest
+   * was unparseable as JSON, manifest.value will be undefined and manifest.debugString
+   * will have the reason. See manifest-parser.js for more information.
+   * @param {!Object} options
+   * @return {!Promise<?Manifest>}
+   */
   afterPass(options) {
-    return options.driver.sendCommand('Page.getAppManifest')
+    const manifestPromise = options.driver.getAppManifest();
+    const timeoutPromise = new Promise(resolve => setTimeout(resolve, 3000));
+    return Promise.race([manifestPromise, timeoutPromise])
       .then(response => {
-        // We're not reading `response.errors` however it may contain critical and noncritical
-        // errors from Blink's manifest parser:
-        //   https://chromedevtools.github.io/debugger-protocol-viewer/tot/Page/#type-AppManifestError
-        if (!response.data) {
-          let errorString;
-          if (response.url) {
-            errorString = `Unable to retrieve manifest at ${response.url}`;
-          } else {
-            // The driver will return an empty string for url and the data if
-            // the page has no manifest.
-            errorString = 'No manifest found.';
-          }
+        if (!response) {
+          return null;
+        }
 
-          return Manifest._errorManifest(errorString);
+        const isBomEncoded = response.data.charCodeAt(0) === BOM_FIRSTCHAR;
+        if (isBomEncoded) {
+          response.data = Buffer.from(response.data).slice(BOM_LENGTH).toString();
         }
 
         return manifestParser(response.data, response.url, options.url);
-      }, err => {
-        return Manifest._errorManifest('Unable to retrieve manifest: ' + err);
       });
   }
 }
